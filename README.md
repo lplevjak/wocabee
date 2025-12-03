@@ -1,11 +1,5 @@
-# Wocabee bot + library
+**WOCABEE BOT**
+$env:WOCA_USER='username'; $env:WOCA_PASS='password'; py -3 -u main.py --class 0 --do-package-name L1_1 > run_L1_1.log 2>&1
 
-## A simple multi-purpose wocabee bot based on selenium
-
-### Installation
-
-- Download as zip and extract or:`git clone https://github.com/sneznykocur/wocabee`
-- install selenium:`pip install selenium webdriver-manager`
-~~### UPDATE~~
-~~NOW A [WEBSITE](https://wocabee.sneznykocur.sk)~~
-
+**Wocabee Ucty**
+Username        Password        Lekcie-Balíky
