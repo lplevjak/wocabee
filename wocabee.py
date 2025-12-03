@@ -3,14 +3,18 @@ import json
 import time
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, WebDriverException, InvalidSessionIdException, TimeoutException
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from webdriver_manager.firefox import GeckoDriverManager
 from selenium.webdriver.common import actions
 import time, json, os, datetime,threading
+import concurrent.futures
 from selenium.webdriver.common.by import By
 from selenium import webdriver
 import traceback
+import socket
+import subprocess
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.firefox.options import Options
 class wocabee:
     def __init__(self,udaje: tuple):
@@ -32,17 +36,43 @@ class wocabee:
         self.LEARNALL = 3
         self.GETPACKAGE = 4
         self.udaje = udaje
+        # thread pool for lightweight parallel processing used by get_packages
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         #try:
         #    service = GeckoDriverManager().install()
         #    self.driver = webdriver.Firefox(service=FirefoxService(service))
         #except Exception as e:
         #    traceback.print_exception(e)
         options = Options()
-        #options.headless = True
-        #options.add_argument("--headless")
-        self.driver = webdriver.Firefox(options=options)
-    
-        self.driver.get(self.url)
+        # Run Firefox in headless mode to improve stability in this environment
+        options.headless = True
+        # Add additional headless args only on non-Windows systems (these flags are Linux-focused)
+        try:
+            import platform
+            if platform.system().lower() != 'windows':
+                options.add_argument('--no-sandbox')
+                options.add_argument('--disable-dev-shm-usage')
+        except Exception:
+            # if platform check fails, don't add Linux-specific args
+            pass
+
+        # start driver using helper (adds resilience)
+        try:
+            self.start_driver(options)
+        except Exception:
+            traceback.print_exc()
+            # fallback to a plain firefox start
+            try:
+                self.driver = webdriver.Firefox(options=options)
+            except Exception:
+                traceback.print_exc()
+
+        # navigate to URL (if driver available)
+        try:
+            if hasattr(self, 'driver') and self.driver:
+                self.driver.get(self.url)
+        except Exception:
+            traceback.print_exc()
     def init(self):
         self.word_dictionary = self._dictionary_Load()
         self.class_names = []
@@ -70,8 +100,214 @@ class wocabee:
         print(f"finished init {self.class_names}")
         time.sleep(2)
 
+    def start_driver(self, options: Options = None):
+        """Start geckodriver + Firefox WebDriver using webdriver-manager and store service reference."""
+        if options is None:
+            options = Options()
+        # If a manual geckodriver was started on the default port, prefer connecting to it via Remote
+        try:
+            manual_out = os.path.join(os.getcwd(), "geckodriver_manual_out.log")
+            if os.path.exists(manual_out):
+                with open(manual_out, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                if 'Listening on 127.0.0.1:4444' in text:
+                    try:
+                        remote_url = 'http://127.0.0.1:4444'
+                        desired = DesiredCapabilities.FIREFOX.copy()
+                        print(f"{self.info} Found manual geckodriver listening on 4444, attempting Remote connect")
+                        self.driver = webdriver.Remote(command_executor=remote_url, desired_capabilities=desired, options=options)
+                        print(f"{self.ok} Connected to manual geckodriver via Remote {remote_url}")
+                        return
+                    except Exception:
+                        # fall through to normal start logic
+                        pass
+        except Exception:
+            pass
+        # Prefer Selenium Manager (let selenium handle driver binaries) which usually picks a geckodriver
+        # compatible with the installed Firefox version. If that fails, fall back to webdriver-manager.
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                self.driver = webdriver.Firefox(options=options)
+                return
+            except Exception as e:
+                last_exc = e
+                print(f"{self.warn} Selenium Manager start attempt {attempt}/3 failed: {e}")
+                time.sleep(1.0)
+
+        # Fallback: use webdriver-manager to install a geckodriver binary and start via service
+        gd_path = GeckoDriverManager().install()
+        log_path = os.path.join(os.getcwd(), "geckodriver.log")
+        service = FirefoxService(executable_path=gd_path, log_path=log_path)
+        # store service so we can stop it later
+        self._gecko_service = service
+        # create driver (this will start the service if needed)
+        # Sometimes the service process may die or bind slowly; retry a few times and surface the geckodriver log on failure.
+        for attempt in range(1, 6):
+            try:
+                self.driver = webdriver.Firefox(service=service, options=options)
+                # successful start
+                return
+            except Exception as e:
+                last_exc = e
+                print(f"{self.warn} Failed to start Firefox WebDriver via webdriver-manager (attempt {attempt}/5): {e}")
+                time.sleep(1.0)
+        # if we get here, all attempts failed — print traceback and dump geckodriver.log if present
+        traceback.print_exc()
+        try:
+            if os.path.exists(log_path):
+                print(f"{self.info} --- tail of geckodriver.log ---")
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()[-200:]
+                print(''.join(lines))
+            else:
+                print(f"{self.warn} geckodriver.log not found at {log_path}")
+        except Exception:
+            traceback.print_exc()
+
+        # Final fallback: start geckodriver manually as a subprocess so we can capture stdout/stderr
+        try:
+            # pick an available port
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+
+            manual_log = os.path.join(os.getcwd(), "geckodriver_manual.log")
+            cmd = [gd_path, "--port", str(port)]
+            print(f"{self.info} Launching geckodriver manually on port {port}, logging to {manual_log}")
+            lf = open(manual_log, 'a', encoding='utf-8', errors='replace')
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            # store process so we can terminate later
+            self._manual_geckodriver_proc = proc
+
+            # give it a moment to start and bind
+            time.sleep(0.8)
+
+            # try to connect using Remote webdriver
+            remote_url = f"http://127.0.0.1:{port}"
+            desired = DesiredCapabilities.FIREFOX.copy()
+            # Try a few times to connect to the manual geckodriver
+            for attempt in range(1, 6):
+                try:
+                    print(f"{self.info} Attempting Remote connect to {remote_url} (try {attempt})")
+                    self.driver = webdriver.Remote(command_executor=remote_url, desired_capabilities=desired, options=options)
+                    print(f"{self.ok} Connected to manual geckodriver (pid={proc.pid})")
+                    return
+                except Exception as e:
+                    print(f"{self.warn} Remote connect attempt {attempt} failed: {e}")
+                    time.sleep(0.6)
+
+            # if still failing, dump manual log tail
+            try:
+                lf.flush()
+                lf.close()
+                if os.path.exists(manual_log):
+                    print(f"{self.info} --- tail of geckodriver_manual.log ---")
+                    with open(manual_log, 'r', encoding='utf-8', errors='replace') as f:
+                        lines = f.readlines()[-500:]
+                    print(''.join(lines))
+            except Exception:
+                traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+
+        # re-raise the last exception so caller knows startup failed
+        raise last_exc
+
+    def restart_driver(self, options: Options = None):
+        """Attempt to stop existing driver/service and restart once."""
+        try:
+            # Quit existing webdriver if present
+            if hasattr(self, 'driver') and self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+
+            # Stop geckodriver service if we started it
+            if hasattr(self, '_gecko_service') and self._gecko_service:
+                try:
+                    self._gecko_service.stop()
+                except Exception:
+                    pass
+
+            # Terminate manual geckodriver subprocess if present
+            if hasattr(self, '_manual_geckodriver_proc') and self._manual_geckodriver_proc:
+                try:
+                    self._manual_geckodriver_proc.terminate()
+                    self._manual_geckodriver_proc.wait(timeout=1)
+                except Exception:
+                    pass
+
+            # small pause to allow socket cleanup before restart
+            time.sleep(1.0)
+
+            # Start a fresh driver
+            self.start_driver(options)
+
+            # After restarting the driver, try to restore the previous session state: navigate to URL and re-login
+            try:
+                if hasattr(self, 'driver') and self.driver:
+                    try:
+                        self.driver.get(self.url)
+                    except Exception:
+                        pass
+
+                if hasattr(self, 'udaje') and self.udaje:
+                    username, password = self.udaje
+                    try:
+                        self.login(username, password)
+                    except Exception:
+                        pass
+
+                    # small wait and quick check for logged-in state
+                    t0 = time.time()
+                    while time.time() - t0 < 8:
+                        try:
+                            if self.is_loggedIn():
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+            except Exception:
+                traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+
     def quit(self):
-        self.driver.quit()
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        # stop geckodriver service if we started it
+        try:
+            if hasattr(self, '_gecko_service') and self._gecko_service:
+                try:
+                    self._gecko_service.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # shutdown thread pool
+        try:
+            if hasattr(self, 'executor') and self.executor:
+                try:
+                    self.executor.shutdown(wait=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # ensure manual geckodriver process is terminated
+        try:
+            if hasattr(self, '_manual_geckodriver_proc') and self._manual_geckodriver_proc:
+                try:
+                    self._manual_geckodriver_proc.terminate()
+                    self._manual_geckodriver_proc.wait(timeout=1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     def elem_type(self,by,elem,x):
         #print("typing:",elem,x)
         elem = self.get_element(by,elem)
@@ -117,8 +353,37 @@ class wocabee:
         else:
             return [0]
     def wait_for_element(self,timeout,by,element):
-        WebDriverWait(self.driver,timeout).until(lambda x: self.driver.find_element(by,element).is_displayed())
-        return self.get_element(by,element)
+        # Try to wait for element. Distinguish between timeouts (element missing) and session-level errors.
+        try:
+            WebDriverWait(self.driver, timeout).until(lambda x: self.driver.find_element(by, element).is_displayed())
+            return self.get_element(by, element)
+        except TimeoutException:
+            # Element not present within timeout — don't restart driver; return None and let caller handle it
+            return None
+        except InvalidSessionIdException as e:
+            # Session is invalid — try restart once
+            print(f"{self.warn} InvalidSession in wait_for_element: {e}; restarting driver...")
+            try:
+                self.restart_driver()
+                WebDriverWait(self.driver, timeout).until(lambda x: self.driver.find_element(by, element).is_displayed())
+                return self.get_element(by, element)
+            except Exception:
+                traceback.print_exc()
+                raise
+        except WebDriverException as e:
+            # WebDriver exceptions can be due to session/connection issues or other problems.
+            msg = str(e)
+            if 'Tried to run command without establishing a connection' in msg or 'Failed to decode response from marionette' in msg or 'connection refused' in msg.lower():
+                print(f"{self.warn} WebDriver connection issue in wait_for_element: {e}; restarting driver...")
+                try:
+                    self.restart_driver()
+                    WebDriverWait(self.driver, timeout).until(lambda x: self.driver.find_element(by, element).is_displayed())
+                    return self.get_element(by, element)
+                except Exception:
+                    traceback.print_exc()
+                    raise
+            # otherwise, re-raise so the caller can decide — treat as missing element
+            return None
     def wait_for_element_in_element(self,timeout,elem,by,element):
         WebDriverWait(self.driver,timeout).until(lambda x: elem.find_element(by,element).is_displayed())
         return self.get_element(by,element)
@@ -317,8 +582,8 @@ class wocabee:
             return
         end = ""
         index = 0
-        print(f"{self.debug} {missing.count("_")}")
-        for _ in range(missing.count("_")+1):
+        print(f"{self.debug} {missing.count('_')}")
+        for _ in range(missing.count('_')+1):
             x = missing.find("_",index)
             print(f"{self.debug} {x} {_} {word[x]} {index}")
             end+=word[x]

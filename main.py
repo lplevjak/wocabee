@@ -2,6 +2,8 @@ import argparse
 from selenium.webdriver.common.by import By
 from time import sleep
 import getpass
+import os
+import sys
 from wocabee import wocabee
 import traceback
 #TODO: GUI
@@ -118,6 +120,8 @@ parser.add_argument("--points",dest="target_points",required=False)
 parser.add_argument("--class",dest="classid",required=False)
 parser.add_argument("--package",dest="package",required=False)
 parser.add_argument("--do-package",action='store_true',dest="do_package",required=False)
+parser.add_argument("--do-package-name", dest="do_package_name", required=False,
+                    help="(optional) run a package by substring of its name, e.g. 'L5_1'")
 parser.add_argument("--learn-all",action="store_true",dest="learnall",required=False)
 parser.add_argument("--get-classes","--classes",action="store_true",dest="getclasses",required=False)
 parser.add_argument("--get-packages","--packages",action="store_true",dest="getpackages",required=False)
@@ -125,16 +129,47 @@ parser.add_argument("--get-leaderboard","--leaderboard",action="store_true",dest
 parser.add_argument("--auto",action="store_true",dest="auto",required=False)
 parser.add_argument("--leaderboard-pos","--pos",action="store_true",dest="pos",required=False)
 parser.add_argument("--learn", action="store_true",dest="learn",required=False)
+parser.add_argument("--username", dest="cli_username", required=False,
+                    help="(optional) username to use instead of interactive prompt")
+parser.add_argument("--password", dest="cli_password", required=False,
+                    help="(optional) password to use instead of interactive prompt (insecure on command line)")
 args = parser.parse_args()
 
 
-woca = wocabee(udaje=(input("Username:"),getpass.getpass()))
+woca_username = None
+woca_password = None
+
+# 1) CLI args
+if args.cli_username:
+    woca_username = args.cli_username
+if args.cli_password:
+    woca_password = args.cli_password
+
+# 2) environment variables fallback
+if not woca_username:
+    woca_username = (os.environ.get('WOCA_USER') or os.environ.get('WOCA_USERNAME'))
+if not woca_password:
+    woca_password = (os.environ.get('WOCA_PASS') or os.environ.get('WOCA_PASSWORD'))
+
+# 3) interactive prompt fallback
+if not woca_username:
+    print("Username:", end=' ', flush=True)
+    woca_username = input()
+if not woca_password:
+    woca_password = getpass.getpass(prompt='Password: ')
+
+woca = wocabee(udaje=(woca_username, woca_password))
 woca.init()
 if args.getclasses:
     for i,x in enumerate(woca.get_classes()):
         print(i,x)
     woca.quit()
 if args.getpackages:
+    # If a class id was supplied, pick that class first so the package listing is populated
+    if args.classid:
+        woca.pick_class(args.classid, woca.get_classes())
+        # give the page a moment to render package list
+        sleep(2)
     for i,x in enumerate(woca.get_packages(woca.GETPACKAGE)):
         print(i,x)
     woca.quit()
@@ -146,6 +181,47 @@ if not args.classid:
 
 
 woca.pick_class(args.classid,woca.get_classes())
+# If user requested package by name substring, find its numeric index and run it
+if args.do_package_name:
+    # GETPACKAGE returns names and playable flags; DOPACKAGE contains clickable entries
+    all_packages = woca.get_packages(woca.GETPACKAGE)
+    playable_names = [list(p.keys())[0] for p in all_packages if p and list(p.values())[0]]
+    # find first playable package whose name contains the substring
+    picked_name = None
+    for name in playable_names:
+        if args.do_package_name in name:
+            picked_name = name
+            break
+    if not picked_name:
+        print(f"No package found matching '{args.do_package_name}'")
+        woca.quit()
+        exit(1)
+    # map chosen playable name to the index in the DOPACKAGE listing (playable-only list)
+    dopackages = woca.get_packages(woca.DOPACKAGE)
+    dop_names = []
+    # DOPACKAGE entries use numeric keys for ordering; extract names where possible
+    for p in dopackages:
+        # try to get the visible text of the button element if available
+        try:
+            btn = list(p.values())[0]
+            text = btn.text if hasattr(btn, 'text') else None
+        except Exception:
+            text = None
+        dop_names.append(text)
+    # find index by matching text substring
+    picked_index = None
+    for i, text in enumerate(dop_names):
+        if text and args.do_package_name in text:
+            picked_index = i
+            break
+    # fallback: if dop_names are not available, fall back to playable_names index
+    if picked_index is None:
+        try:
+            picked_index = playable_names.index(picked_name)
+        except Exception:
+            picked_index = 0
+    print(f"Running package #{picked_index}: {picked_name}")
+    zrob_balik(picked_index)
 if args.practice:
     if not args.target_points:
         args.target_points = input("points:")
